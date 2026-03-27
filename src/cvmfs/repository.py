@@ -173,6 +173,7 @@ class Repository(object):
             del self._opened_catalogs[catalog.hash]
         except KeyError as e:
             print("not found:" , catalog.hash)
+        catalog.close()
 
     def _retrieve_and_open_catalog(self, catalog_hash):
         catalog_file = self.retrieve_object(catalog_hash, 'C')

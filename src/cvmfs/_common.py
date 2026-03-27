@@ -34,9 +34,14 @@ class DatabaseObject:
         self._open_database()
 
     def __del__(self):
+        self.close()
+
+    def close(self):
         if self._db_handle:
             self._db_handle.close()
-        self._file.close()
+            self._db_handle = None
+        if self._file and not self._file.closed:
+            self._file.close()
 
     def _open_database(self):
         """ Create and configure a database handle to the Catalog """
