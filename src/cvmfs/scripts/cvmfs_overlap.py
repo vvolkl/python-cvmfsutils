@@ -11,18 +11,28 @@ The script downloads (and caches) all required catalogs for both
 repositories.  The hash index for repo B is stored in
 ~/.cache/cvmfs-overlap/ so that subsequent runs against the same revision
 of repo B are fast.
+
+Sizes are the uncompressed sizes recorded in the catalogs; --sample-compressed
+estimates compressed sizes from a random sample of overlapping objects.
 """
 
 import argparse
 import fnmatch
 import os
 import os.path
+import random
 import sqlite3
 import sys
+import threading
 import time
 from collections import defaultdict
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
 
 import cvmfs
+from cvmfs.catalog import Catalog
 
 CACHE_VERSION = "v1"
 
@@ -182,50 +192,77 @@ def _resolve_symlink_target(parent_dir, target):
 # Catalog traversal that avoids downloading irrelevant catalogs
 # ---------------------------------------------------------------------------
 
-def _iter_relevant_catalogs(rev, patterns):
+_CATALOG_FETCH_ATTEMPTS = 3
+
+
+def _fetch_catalog(repo, cat_hash):
+    for attempt in range(_CATALOG_FETCH_ATTEMPTS):
+        try:
+            return repo.retrieve_object(cat_hash, "C")
+        except (requests.RequestException, OSError):
+            if attempt + 1 == _CATALOG_FETCH_ATTEMPTS:
+                raise
+            time.sleep(2 ** attempt)
+
+
+def walk_catalogs(repo, root_hash, expand, jobs=1, root_ctx=None):
+    """
+    Yield ``(catalog, ctx)`` for the root catalog and every nested catalog
+    that *expand* selects.
+
+    ``expand(catalog, ctx)`` is called after the caller is done with a catalog
+    and returns ``(nested_hash, nested_ctx)`` pairs to visit.  The catalog is
+    closed right after.  With *jobs* > 1, up to ``4 * jobs`` queued catalogs
+    are downloaded ahead in worker threads; SQLite access stays on the
+    calling thread.  Malformed catalogs are reported and skipped.
+    """
+    queue = deque([(root_hash, root_ctx)])
+    inflight = deque()
+    lookahead = max(1, 4 * jobs)
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        while queue or inflight:
+            while queue and len(inflight) < lookahead:
+                cat_hash, ctx = queue.popleft()
+                fut = pool.submit(_fetch_catalog, repo, cat_hash)
+                inflight.append((fut, cat_hash, ctx))
+            fut, cat_hash, ctx = inflight.popleft()
+            try:
+                clg = Catalog(fut.result(), cat_hash)
+            except sqlite3.DatabaseError as exc:
+                print(
+                    f"  WARNING: skipping malformed catalog {cat_hash[:12]}…: {exc}\n"
+                    "           (re-run with --no-cache or clear the catalog cache"
+                    " to force a fresh download)",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                yield clg, ctx
+                queue.extend(expand(clg, ctx))
+            finally:
+                clg.close()
+
+
+def _iter_relevant_catalogs(rev, patterns, jobs=1):
     """
     Yield catalogs from *rev* that are relevant to *patterns*.
 
-    Catalogs are fetched **lazily** — only when they are popped from the
-    stack — and **closed** immediately after the caller has finished with
-    them.  This means at most one catalog file handle is open at any given
-    time, regardless of how many catalogs the repository contains.
-
-    The stack stores plain catalog hash strings rather than ``Catalog``
-    objects, so no file handles are held while waiting on the stack.
-    ``CatalogReference.root_path`` is still used for the relevance check
-    before pushing a hash, so irrelevant subtrees are never downloaded.
+    ``CatalogReference.root_path`` is checked before a nested catalog is
+    queued, so irrelevant subtrees are never downloaded.
     """
-    # Seed the stack with the root catalog's hash.
-    stack = [rev.root_hash]
+    def expand(clg, _):
+        return [(ref.hash, None) for ref in clg.list_nested()
+                if _prefix_is_relevant(ref.root_path, patterns)]
 
-    while stack:
-        cat_hash = stack.pop()
-        try:
-            clg = rev.repository.retrieve_catalog(cat_hash)
-        except sqlite3.DatabaseError as exc:
-            print(
-                f"  WARNING: skipping malformed catalog {cat_hash[:12]}…: {exc}\n"
-                "           (re-run with --no-cache or clear the catalog cache"
-                " to force a fresh download)",
-                file=sys.stderr,
-            )
-            continue
+    for clg, _ in walk_catalogs(rev.repository, rev.root_hash, expand, jobs):
         yield clg
-        # Execution resumes here after the caller has finished with clg.
-        # Read nested references while the catalog is still open, then
-        # close it before moving on to the next one.
-        for nested_ref in clg.list_nested():
-            if _prefix_is_relevant(nested_ref.root_path, patterns):
-                stack.append(nested_ref.hash)
-        rev.repository.close_catalog(clg)
 
 
 # ---------------------------------------------------------------------------
 # Build / load the hash index for repo B
 # ---------------------------------------------------------------------------
 
-def _collect_hashes(rev, include_chunks):
+def _collect_hashes(rev, include_chunks, jobs=1):
     """
     Walk all catalogs in *rev* and return a ``{hash_bytes: size_bytes}`` dict.
 
@@ -236,26 +273,8 @@ def _collect_hashes(rev, include_chunks):
     """
     hash_to_size = {}
     n_catalogs = 0
-    n_skipped  = 0
 
-    # Use an explicit next() loop so that a malformed catalog can be caught
-    # and skipped without aborting the entire collection.
-    catalog_iter = rev.catalogs()
-    while True:
-        try:
-            clg = next(catalog_iter)
-        except StopIteration:
-            break
-        except sqlite3.DatabaseError as exc:
-            print(
-                f"  WARNING: skipping malformed catalog: {exc}\n"
-                "           (re-run with --no-cache or clear the catalog cache"
-                " to force a fresh download)",
-                file=sys.stderr,
-            )
-            n_skipped += 1
-            continue
-
+    for clg in _iter_relevant_catalogs(rev, None, jobs):
         prefix_label = clg.root_prefix or "/"
         print(f"    catalog: {prefix_label}", file=sys.stderr)
         n_catalogs += 1
@@ -282,16 +301,6 @@ def _collect_hashes(rev, include_chunks):
             except sqlite3.DatabaseError:
                 pass  # chunks table absent in some old catalogs
 
-        # Release the catalog so its file handle and SQLite connection are
-        # closed promptly rather than accumulating for the entire run.
-        rev.repository.close_catalog(clg)
-
-    if n_skipped:
-        print(
-            f"  WARNING: {n_skipped} catalog(s) skipped due to errors —"
-            " overlap results may be incomplete.",
-            file=sys.stderr,
-        )
     print(
         f"  → {n_catalogs} catalog(s), {len(hash_to_size):,} unique hash(es)",
         file=sys.stderr,
@@ -307,7 +316,7 @@ def _remove_silently(path):
         pass
 
 
-def _build_hash_db(rev, db_path, include_chunks):
+def _build_hash_db(rev, db_path, include_chunks, jobs=1):
     """
     Build a SQLite hash-set cache for *rev* at *db_path*.
 
@@ -326,7 +335,7 @@ def _build_hash_db(rev, db_path, include_chunks):
         "CREATE TABLE hashes (hash BLOB PRIMARY KEY, size INTEGER DEFAULT 0)"
     ).close()
 
-    hash_to_size = _collect_hashes(rev, include_chunks)
+    hash_to_size = _collect_hashes(rev, include_chunks, jobs)
     db.executemany(
         "INSERT OR IGNORE INTO hashes(hash, size) VALUES (?, ?)",
         hash_to_size.items(),
@@ -339,7 +348,7 @@ def _build_hash_db(rev, db_path, include_chunks):
     return hash_to_size
 
 
-def load_hash_index(rev, include_chunks, use_cache=True, cache_dir=None):
+def load_hash_index(rev, include_chunks, use_cache=True, cache_dir=None, jobs=1):
     """
     Return a ``{hash_bytes: size}`` dict for *rev*, using the on-disk cache
     when available (and *use_cache* is True).
@@ -388,7 +397,7 @@ def load_hash_index(rev, include_chunks, use_cache=True, cache_dir=None):
         f"  Building hash index (will be cached at {db_path}) …",
         file=sys.stderr,
     )
-    return _build_hash_db(rev, db_path, include_chunks)
+    return _build_hash_db(rev, db_path, include_chunks, jobs)
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +405,8 @@ def load_hash_index(rev, include_chunks, use_cache=True, cache_dir=None):
 # ---------------------------------------------------------------------------
 
 def compute_overlap(
-    rev_a, hash_b, paths=None, top_n=20, include_chunks=True, follow_symlinks=False
+    rev_a, hash_b, paths=None, top_n=20, include_chunks=True, follow_symlinks=False,
+    sample=None, jobs=1,
 ):
     """
     Walk the selected catalogs of *rev_a* and compute overlap with *hash_b*.
@@ -419,6 +429,11 @@ def compute_overlap(
         When True, symlinks encountered during traversal are resolved and
         their targets are also traversed (with cycle detection).  Only
         targets that are not already covered by *paths* produce extra passes.
+    sample:
+        Optional ``Reservoir`` that receives ``(object_name, size)`` for each
+        overlapping object, for compressed-size estimation.
+    jobs:
+        Number of parallel catalog downloads.
 
     Returns
     -------
@@ -473,7 +488,7 @@ def compute_overlap(
 
         new_symlink_targets = set()
 
-        for clg in _iter_relevant_catalogs(rev_a, effective_paths):
+        for clg in _iter_relevant_catalogs(rev_a, effective_paths, jobs):
             prefix_label = clg.root_prefix or "/"
             print(f"    catalog: {prefix_label}", file=sys.stderr)
 
@@ -516,6 +531,9 @@ def compute_overlap(
                     overlap_hashes.add(hash_bytes)
                     dir_stats[parent_dir]["overlap_files"] += 1
                     dir_stats[parent_dir]["overlap_size"]  += size
+                    # Bulk objects of chunked files usually do not exist.
+                    if sample is not None and not dirent.has_chunks():
+                        sample.add((object_name(hash_bytes, dirent.flags), size))
 
                 # Chunk-level overlap (populated by _read_chunks in catalog.py).
                 if include_chunks and dirent.has_chunks():
@@ -528,6 +546,9 @@ def compute_overlap(
                             overlap_chunks += 1
                             overlap_chunk_hashes.add(ch)
                             chunk_overlap_size += chunk_size
+                            if sample is not None:
+                                sample.add((object_name(ch, dirent.flags, "P"),
+                                            chunk_size))
 
         return new_symlink_targets
 
@@ -597,10 +618,101 @@ def _pct(num, denom):
 
 
 # ---------------------------------------------------------------------------
+# Compressed-size estimation
+# ---------------------------------------------------------------------------
+
+# Hash algorithm id ((flags >> 8) & 7) + 1 → CAS name suffix (cvmfs/crypto/hash.cc)
+_ALGO_SUFFIX = {1: "", 2: "-rmd160", 3: "-shake128"}
+
+
+def object_name(hash_bytes, flags, suffix=""):
+    """Return the CAS object name for a catalog hash BLOB and its dirent flags."""
+    algo = ((flags >> 8) & 7) + 1
+    return hash_bytes.hex() + _ALGO_SUFFIX.get(algo, "") + suffix
+
+
+class Reservoir:
+    """Uniform random sample of at most *k* items from a stream."""
+
+    def __init__(self, k):
+        self.k = k
+        self.seen = 0
+        self.items = []
+
+    def add(self, item):
+        self.seen += 1
+        if len(self.items) < self.k:
+            self.items.append(item)
+        else:
+            j = random.randrange(self.seen)
+            if j < self.k:
+                self.items[j] = item
+
+
+# Reuse connections: one-shot requests exhaust ephemeral ports (EADDRNOTAVAIL)
+# at tens of thousands of samples.
+_thread_local = threading.local()
+
+
+def _session():
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
+
+
+def _stored_size(repo, name):
+    path = f"data/{name[:2]}/{name[2:]}"
+    source = repo._fetcher.source
+    if source.startswith(("http://", "https://")):
+        try:
+            r = _session().head(f"{source.rstrip('/')}/{path}", timeout=30,
+                                allow_redirects=True)
+        except requests.RequestException:
+            return None
+        if r.status_code != requests.codes.ok:
+            return None
+        length = r.headers.get("Content-Length")
+        return int(length) if length is not None else None
+    try:
+        return os.path.getsize(os.path.join(source, path))
+    except OSError:
+        return None
+
+
+def estimate_compression_ratio(repo, samples, workers=16):
+    """
+    Measure stored (compressed) sizes of *samples* — ``(object_name, size)``
+    pairs — in *repo*'s backend.
+
+    Returns ``(ratio, n_ok, n_failed)`` where ratio is stored / uncompressed
+    bytes over the successfully measured samples, or None if none succeeded.
+    """
+    if not samples:
+        return None, 0, 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        stored = list(pool.map(lambda s: _stored_size(repo, s[0]), samples))
+    ok = [(s[1], c) for s, c in zip(samples, stored) if c is not None]
+    raw = sum(u for u, _ in ok)
+    ratio = sum(c for _, c in ok) / raw if raw else None
+    return ratio, len(ok), len(samples) - len(ok)
+
+
+def fmt_ratio_line(label, size, ratio_info):
+    """Format an estimated-compressed-size report line."""
+    ratio, n_ok, n_failed = ratio_info
+    if ratio is None:
+        return f"  {label:<34} {'n/a':>12}   (no samples measured)"
+    failed = f", {n_failed} failed" if n_failed else ""
+    return (f"  {label:<34} {_fmt_size(size * ratio):>12}"
+            f"   (ratio {ratio:.3f}, {n_ok} samples{failed})")
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
-def print_report(r, repo_a_id, repo_b_id, paths, top_n, follow_symlinks):
+def print_report(r, repo_a_id, repo_b_id, paths, top_n, follow_symlinks,
+                 ratio_info=None):
     sep  = "=" * 66
     sep2 = "-" * 66
 
@@ -645,6 +757,15 @@ def print_report(r, repo_a_id, repo_b_id, paths, top_n, follow_symlinks):
         print(f"  {'Overlapping unique chunk hashes:':<34} {r['overlap_chunk_hashes']:>10,}"
               f"   ({_pct(r['overlap_chunk_hashes'], r['unique_chunks_a'])})")
         print(f"  {'Chunk overlap size:':<34} {_fmt_size(r['chunk_overlap_size']):>12}")
+
+    print()
+    print("  Sizes are uncompressed (as recorded in the catalogs).")
+    if ratio_info is not None:
+        print(fmt_ratio_line("Est. compressed overlap size:",
+                             r["overlap_size"], ratio_info))
+        if r["total_chunks"] > 0:
+            print(fmt_ratio_line("Est. compressed chunk overlap:",
+                                 r["chunk_overlap_size"], ratio_info))
 
     top_dirs = [(d, s) for d, s in r["top_dirs"] if s["overlap_size"] > 0]
     if top_dirs:
@@ -755,6 +876,22 @@ def main():
         help="Directory used to store the compiled hash-index for repo B "
              f"(default: {DEFAULT_CACHE_PATH}).",
     )
+    parser.add_argument(
+        "-j", "--jobs",
+        metavar="N",
+        type=int,
+        default=8,
+        help="Number of parallel catalog downloads (default: 8).",
+    )
+    parser.add_argument(
+        "--sample-compressed",
+        metavar="N",
+        type=int,
+        default=0,
+        help="Estimate compressed overlap size by measuring the stored size "
+             "of N randomly sampled overlapping objects in repo A's backend "
+             "(HEAD requests for HTTP repos).",
+    )
 
     args = parser.parse_args()
 
@@ -783,6 +920,7 @@ def main():
         include_chunks=args.chunks,
         use_cache=args.cache,
         cache_dir=args.index_cache_dir,
+        jobs=args.jobs,
     )
     print(f"  {len(hash_b):,} unique hash(es) in {time.monotonic() - t0:.1f}s",
           file=sys.stderr)
@@ -798,6 +936,7 @@ def main():
     if args.follow_symlinks:
         print("  (symlink following enabled)", file=sys.stderr)
 
+    sample = Reservoir(args.sample_compressed) if args.sample_compressed > 0 else None
     t0     = time.monotonic()
     result = compute_overlap(
         rev_a,
@@ -806,14 +945,23 @@ def main():
         top_n=args.top,
         include_chunks=args.chunks,
         follow_symlinks=args.follow_symlinks,
+        sample=sample,
+        jobs=args.jobs,
     )
     print(f"  Done in {time.monotonic() - t0:.1f}s", file=sys.stderr)
+
+    ratio_info = None
+    if sample is not None:
+        print(f"\nMeasuring stored size of {len(sample.items)} sampled object(s) …",
+              file=sys.stderr)
+        ratio_info = estimate_compression_ratio(repo_a, sample.items)
 
     # ------------------------------------------------------------------
     # Print the report
     # ------------------------------------------------------------------
     print_report(
-        result, args.repo_a, args.repo_b, args.paths, args.top, args.follow_symlinks
+        result, args.repo_a, args.repo_b, args.paths, args.top, args.follow_symlinks,
+        ratio_info,
     )
 
 
